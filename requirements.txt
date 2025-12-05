@@ -1,0 +1,16 @@
+langchain
+langchain-core
+langchain-openai
+langchain-community
+langchain-text-splitters
+chromadb
+pypdf
+python-dotenv
+tiktoken
+
+# Web app
+gradio
+
+# Optional but useful
+uvicorn
+fastapi
