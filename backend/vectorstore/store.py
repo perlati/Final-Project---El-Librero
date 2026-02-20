@@ -62,6 +62,38 @@ def add_documents_to_collection(documents: List[Document], collection_name: str)
     return len(documents)
 
 
+def get_all_documents(collection_name: str, doc_type: str | None = None) -> List[Document]:
+    """
+    Load all documents from a Chroma collection into memory.
+
+    Used to build a BM25 index for hybrid retrieval.  Only call this at
+    startup — it is a full collection scan and should not be called per
+    query.
+
+    Args:
+        collection_name: Chroma collection to scan.
+        doc_type: If set, keep only chunks whose ``doc_type`` metadata
+                  field equals this value (e.g. ``"catalog_book"``).
+
+    Returns:
+        List of LangChain Document objects.
+    """
+    vs = get_vectorstore(collection_name)
+    where = {"doc_type": {"$eq": doc_type}} if doc_type else None
+
+    kwargs: dict = {"include": ["documents", "metadatas"]}
+    if where:
+        kwargs["where"] = where
+
+    result = vs._collection.get(**kwargs)
+
+    docs = []
+    for text, meta in zip(result["documents"], result["metadatas"]):
+        if text:  # skip empty chunks
+            docs.append(Document(page_content=text, metadata=meta or {}))
+    return docs
+
+
 def get_retriever(collection_name: str, search_k: int = 6):
     """
     Return a simple similarity-search retriever (legacy helper).

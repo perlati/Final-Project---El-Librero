@@ -7,6 +7,7 @@ chromadb
 pypdf
 python-dotenv
 tiktoken
+rank-bm25
 
 # Web app
 gradio

@@ -4,8 +4,14 @@ from langchain_core.tools import tool
 
 from backend.rag.chains import build_books_rag_chain, build_summarize_book_chain
 
-# Build the chains once (with multi-query enabled for better recall)
-_books_rag_chain = build_books_rag_chain(use_multi_query=True)
+# Build chains once at startup.
+# Hybrid retrieval (BM25 + MMR) + multi-query + LLM reranking give the
+# best catalogue recall.  The vectorstore must be populated before import.
+_books_rag_chain = build_books_rag_chain(
+    use_multi_query=True,
+    use_hybrid=True,
+    use_reranking=True,
+)
 _summarize_chain = build_summarize_book_chain()
 
 
