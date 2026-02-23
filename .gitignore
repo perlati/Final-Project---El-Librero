@@ -44,7 +44,7 @@ venv.bak/
 .env.*.local
 
 # Vectorstore (large binary data - do not commit)
-vectorstore/
+/vectorstore/
 *.sqlite3
 
 # Jupyter Notebook

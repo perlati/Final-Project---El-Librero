@@ -9,7 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 
 from backend.config import LLM_MODEL, BOOKS_COLLECTION
-from backend.vectorstore.store import get_vectorstore
+from backend.vectorstore.store import get_vectorstore, get_all_documents
 
 
 def _normalize_title_for_grouping(title: str) -> str:
@@ -260,18 +260,131 @@ def _format_docs(docs: List[Document]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def build_books_rag_chain(use_multi_query: bool = False, filters: Optional[Dict[str, Any]] = None):
+def build_hybrid_retriever(filters: Optional[Dict[str, Any]] = None):
     """
-    Build a comprehensive RAG chain over the books collection.
-    
-    Uses book cards aggregation to show the LLM all relevant catalogue books,
-    enabling comprehensive answers that list multiple relevant titles.
+    Ensemble retriever combining BM25 (keyword) + MMR (semantic) search.
+
+    BM25 improves recall for exact names, events, and technical terms
+    that the embedding space may under-weight.  The MMR retriever adds
+    semantic recall for broad topics and synonymous phrasings.
+
+    Weights: 30 % BM25 · 70 % MMR vector.
 
     Args:
-        use_multi_query: If True, generate query variations for better recall
-        filters: Optional metadata filters (e.g., {"pub_year": {"$gte": 2010}})
+        filters: Optional extra Chroma metadata filters (applied to the
+                 vector leg only; BM25 is pre-filtered at doc load time).
 
-    Input: user question (string)
+    Returns:
+        An EnsembleRetriever instance ready for .invoke(query).
+    """
+    from langchain_community.retrievers import BM25Retriever
+    from langchain.retrievers import EnsembleRetriever
+
+    # --- BM25 leg: keyword matching over all catalog chunks ---
+    catalog_docs = get_all_documents(BOOKS_COLLECTION, doc_type="catalog_book")
+    bm25_retriever = BM25Retriever.from_documents(catalog_docs, k=40)
+
+    # --- MMR leg: semantic search with diversity ---
+    mmr_retriever = get_books_retriever(filters=filters)
+
+    return EnsembleRetriever(
+        retrievers=[bm25_retriever, mmr_retriever],
+        weights=[0.3, 0.7],
+    )
+
+
+def _rerank_docs(docs: List[Document], query: str, top_k: int = 15) -> List[Document]:
+    """
+    LLM-based reranker: scores a candidate list in a single batch call
+    and returns the top_k most relevant documents.
+
+    The LLM is asked to return a comma-separated ranking of document
+    numbers (1-based).  If parsing fails the original order is kept.
+
+    Args:
+        docs: Candidate documents from retrieval.
+        query: The user's original question (used for relevance scoring).
+        top_k: Maximum number of documents to return after reranking.
+
+    Returns:
+        Reranked list of up to top_k Document objects.
+    """
+    if not docs or len(docs) <= top_k:
+        return docs
+
+    candidates = docs[:20]  # cap to control cost
+
+    numbered_snippets = "\n\n".join(
+        f"[{i + 1}] {d.metadata.get('book_title', '?')} "
+        f"({d.metadata.get('pub_year', '?')}): "
+        f"{d.page_content[:250].strip().replace(chr(10), ' ')}"
+        for i, d in enumerate(candidates)
+    )
+
+    llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+    prompt = (
+        f"Eres un asistente editorial. Se hace la siguiente consulta:\n"
+        f'"{query}"\n\n'
+        f"A continuación hay {len(candidates)} fragmentos de libros del catálogo "
+        f"numerados del 1 al {len(candidates)}.\n"
+        f"Devuelve ÚNICAMENTE una lista de los {top_k} fragmentos más relevantes "
+        f"para la consulta, ordenados de mayor a menor relevancia, como números "
+        f"separados por comas (ejemplo: 3,1,7,2...).\n\n"
+        f"Fragmentos:\n{numbered_snippets}"
+    )
+
+    try:
+        response = llm.invoke(prompt)
+        raw = response.content.strip()
+        # Parse "3,1,7,2" → 0-indexed list
+        indices = [
+            int(x.strip()) - 1
+            for x in raw.split(",")
+            if x.strip().lstrip("-").isdigit()
+        ]
+        valid = [i for i in indices if 0 <= i < len(candidates)]
+        reranked = [candidates[i] for i in valid[:top_k]]
+        # Fill any gap with remaining docs not yet included
+        seen = set(valid[:top_k])
+        for i in range(len(candidates)):
+            if len(reranked) >= top_k:
+                break
+            if i not in seen:
+                reranked.append(candidates[i])
+        return reranked
+    except Exception:
+        return docs[:top_k]
+
+
+def build_books_rag_chain(
+    use_multi_query: bool = False,
+    use_hybrid: bool = False,
+    use_reranking: bool = False,
+    filters: Optional[Dict[str, Any]] = None,
+):
+    """
+    Build a comprehensive RAG chain over the books collection.
+
+    Uses book-card aggregation to give the LLM a structured view of all
+    relevant catalogue books and produce comprehensive answers.
+
+    Retrieval pipeline (stages applied in order when enabled):
+      1. **Hybrid** (use_hybrid=True): EnsembleRetriever combining BM25
+         keyword search (30 %) with MMR semantic search (70 %).  Falls
+         back to MMR-only when False.
+      2. **Multi-query** (use_multi_query=True): generates 2 query
+         variations with the LLM, merges and deduplicates results.
+      3. **Reranking** (use_reranking=True): LLM scores the top-20
+         candidate chunks in a single batch call and reorders them.
+
+    Args:
+        use_multi_query: Generate query variations for broader recall.
+        use_hybrid: Use BM25 + MMR ensemble retrieval.
+        use_reranking: Apply LLM reranking after retrieval.
+        filters: Optional Chroma metadata filters applied to the vector
+                 retriever (e.g. ``{"pub_year": {"$gte": 2010}}``).
+
+    Input:  user question (string)
     Output: answer (string) listing all relevant books from the catalogue.
     """
     llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
@@ -306,32 +419,40 @@ def build_books_rag_chain(use_multi_query: bool = False, filters: Optional[Dict[
         ]
     )
 
-    # 1) retriever gets chunk-level docs
-    # 2) docs_to_book_cards groups them into per-book entries
-    # 3) prompt + llm produce final answer
+    # Pipeline:
+    #   1) hybrid or MMR retriever gets chunk-level docs
+    #   2) optional multi-query merges results from query variations
+    #   3) optional LLM reranking reorders by relevance
+    #   4) docs_to_book_cards groups chunks into per-book entries
+    #   5) prompt + LLM produce the final answer
     def _retrieve_and_group(question: str):
+        # Step 1: choose retriever
+        retriever = (
+            build_hybrid_retriever(filters=filters)
+            if use_hybrid
+            else get_books_retriever(filters=filters)
+        )
+
+        # Step 2: retrieve (with optional multi-query expansion)
         if use_multi_query:
-            # Generate query variations and retrieve for each
             queries = _generate_query_variations(question, num_variations=2)
-            all_docs = []
-            seen_ids = set()
-            
-            retriever = get_books_retriever(filters=filters)
-            for query in queries:
-                docs = retriever.invoke(query)
-                # Deduplicate by page_content hash
-                for doc in docs:
+            all_docs: List[Document] = []
+            seen_ids: set = set()
+            for q in queries:
+                for doc in retriever.invoke(q):
                     doc_id = hash(doc.page_content)
                     if doc_id not in seen_ids:
                         seen_ids.add(doc_id)
                         all_docs.append(doc)
-            
-            # Limit to top 40 to avoid context overflow
-            return docs_to_book_cards(all_docs[:40])
         else:
-            retriever = get_books_retriever(filters=filters)
-            docs = retriever.invoke(question)
-            return docs_to_book_cards(docs)
+            all_docs = retriever.invoke(question)
+
+        # Step 3: LLM reranking (optional)
+        if use_reranking:
+            all_docs = _rerank_docs(all_docs, question, top_k=15)
+
+        # Step 4: group into book cards (cap at 40 chunks to avoid overflow)
+        return docs_to_book_cards(all_docs[:40])
 
     rag_chain = (
         {

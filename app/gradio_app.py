@@ -5,10 +5,38 @@ Modern Gradio UI for querying the publishing house's book catalogue.
 Branded with Editorial Dahbar identity and advanced configuration options.
 """
 
+import re
 from typing import List, Tuple
 import gradio as gr
 
 from backend.agents.editorial_agent import agent_answer
+
+
+def _extract_consulted_books(answer: str) -> str:
+    """
+    Parse a search_books answer and return a compact Markdown list of
+    the books cited (title + year + author), for display in the
+    'Libros consultados' sources panel.
+
+    Handles lines like:
+      - **Title (Year), Author** — explanation
+      - Title (Year), Author — explanation
+    """
+    books: List[str] = []
+    for line in answer.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- "):
+            continue
+        content = stripped[2:].strip()
+        # Remove markdown bold markers
+        content = re.sub(r"\*\*(.+?)\*\*", r"\1", content)
+        # Take only the part before the em-dash explanation
+        title_part = content.split(" — ")[0].split(" – ")[0].strip()
+        if title_part:
+            books.append(f"• {title_part}")
+    if not books:
+        return ""
+    return "**📚 Libros consultados en esta respuesta:**\n\n" + "\n\n".join(books)
 
 
 # Editorial Dahbar Brand Colors (from website)
@@ -244,48 +272,45 @@ EXAMPLE_QUESTIONS = [
 
 def process_message(
     message: str,
-    history: List[Tuple[str, str]]
-) -> Tuple[List[Tuple[str, str]], str, str]:
+    history: List[Tuple[str, str]],
+) -> Tuple[List[Tuple[str, str]], str, str, str]:
     """
-    Process a user message and return updated chat history and answer.
-    
+    Process a user message and return updated chat state.
+
     Args:
-        message: User's question
-        history: Current chat history as list of (user_msg, bot_msg) tuples
-        
+        message: User's question.
+        history: Current chat history as list of (user_msg, bot_msg) tuples.
+
     Returns:
-        Tuple of (updated_history, answer_markdown, empty_textbox)
+        Tuple of (updated_history, answer_markdown, sources_markdown, empty_textbox)
     """
     if not message or not message.strip():
-        return history, "", ""
-    
-    # Add user message to history (no bot response in chatbot, only in answer panel)
+        return history, "", "", ""
+
     history = history or []
-    history.append((message, "✓ Procesada"))  # Just show checkmark in chat
-    
+    history.append((message, "✓ Procesada"))
+
     try:
-        # Get answer from backend agent
         answer = agent_answer(message, history[:-1])
-        
-        # Return history with checkmark, full answer in panel only
-        return history, answer, ""
-        
+        sources = _extract_consulted_books(answer)
+        return history, answer, sources, ""
+
     except Exception as e:
         error_msg = (
             f"❌ **Error al consultar el catálogo**\n\n"
             f"`{type(e).__name__}: {str(e)}`"
         )
-        return history, error_msg, ""
+        return history, error_msg, "", ""
 
 
-def clear_conversation() -> Tuple[List, str, str]:
+def clear_conversation() -> Tuple[List, str, str, str]:
     """
-    Clear the conversation history and answer panel.
-    
+    Clear the conversation history, answer panel, and sources panel.
+
     Returns:
-        Tuple of (empty_history, empty_markdown, empty_textbox)
+        Tuple of (empty_history, empty_answer, empty_sources, empty_textbox)
     """
-    return [], "", ""
+    return [], "", "", ""
 
 
 def build_app() -> gr.Blocks:
@@ -350,7 +375,13 @@ def build_app() -> gr.Blocks:
                     value="",
                     elem_classes="answer-panel"
                 )
-                
+
+                # Sources panel — populated from parsed answer bullet points
+                sources_panel = gr.Markdown(
+                    value="",
+                    elem_classes="config-panel"
+                )
+
                 gr.Markdown("---")
                 
                 # Compact chat history
@@ -372,7 +403,7 @@ def build_app() -> gr.Blocks:
                         <div class='tool-spec'>
                         <strong>1. search_books</strong> (Activa)<br>
                         📚 Búsqueda temática en catálogo<br>
-                        <em>Retrieval: MMR k=40, hasta 15 libros</em>
+                        <em>BM25 + MMR · multi-query · reranking · hasta 15 libros</em>
                         </div>
                         
                         <div class='tool-spec'>
@@ -417,10 +448,11 @@ def build_app() -> gr.Blocks:
                         **Chunks totales:**  
                         ~73 libros procesados
                         
-                        **Retrieval:**  
-                        - Algoritmo: MMR (Maximum Marginal Relevance)
+                        **Retrieval:**
+                        - BM25 (30 %) + MMR (70 %) híbrido
                         - k=40 chunks por consulta
-                        - Multi-query: Habilitado
+                        - Multi-query: Habilitado (2 variantes)
+                        - Reranking LLM: Habilitado
                         - Deduplicación: Por título normalizado
                         
                         **Tracking:**  
@@ -467,23 +499,23 @@ def build_app() -> gr.Blocks:
         send_btn.click(
             fn=process_message,
             inputs=[textbox, chatbot],
-            outputs=[chatbot, answer_panel, textbox],
+            outputs=[chatbot, answer_panel, sources_panel, textbox],
         )
-        
+
         # Send message on Enter key
         textbox.submit(
             fn=process_message,
             inputs=[textbox, chatbot],
-            outputs=[chatbot, answer_panel, textbox],
+            outputs=[chatbot, answer_panel, sources_panel, textbox],
         )
-        
+
         # Clear conversation
         clear_btn.click(
             fn=clear_conversation,
             inputs=[],
-            outputs=[chatbot, answer_panel, textbox],
+            outputs=[chatbot, answer_panel, sources_panel, textbox],
         )
-        
+
         # Example buttons - load example text and auto-send
         for i, btn in enumerate(example_buttons):
             example_text = EXAMPLE_QUESTIONS[i]
@@ -494,7 +526,7 @@ def build_app() -> gr.Blocks:
             ).then(
                 fn=process_message,
                 inputs=[textbox, chatbot],
-                outputs=[chatbot, answer_panel, textbox],
+                outputs=[chatbot, answer_panel, sources_panel, textbox],
             )
     
     return app
