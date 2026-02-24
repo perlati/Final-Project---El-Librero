@@ -59,8 +59,8 @@ test_*.py
 # Logs
 *.log
 
-# Data (keep metadata, PDFs are too large for git)
-data/books/*.pdf
+# Data (never commit project data)
+/data/
 
 # Temporary files
 *.tmp
