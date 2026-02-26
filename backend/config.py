@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,6 +19,7 @@ LLM_MODEL = "gpt-4o-mini"
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 # Paths
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = "data"
 BOOKS_DIR = os.path.join(DATA_DIR, "books")
 VECTORSTORE_DIR = "vectorstore"

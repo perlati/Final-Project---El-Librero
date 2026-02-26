@@ -5,7 +5,8 @@ import re
 
 from backend.agents.tools import (
     search_books,
-    summarize_book,
+    summarize_book_tool,
+    deep_insights_book_tool,
     search_media,
     search_contracts,
     recommend_external_books,
@@ -43,37 +44,64 @@ def _extract_book_title(text: str) -> str | None:
     - "resume Libres", "el libro Bifurcación"
     - "ideas centrales de Title"
     """
-    # First try patterns with quotes (most specific)
+    def _is_generic_candidate(candidate: str) -> bool:
+        normalized = candidate.strip().lower()
+        if not normalized:
+            return True
+
+        generic_prefixes = [
+            "uno de los libros",
+            "un libro",
+            "una obra",
+            "algún libro",
+            "algun libro",
+            "los libros",
+            "libros del catálogo",
+            "libros del catalogo",
+        ]
+        if any(normalized.startswith(prefix) for prefix in generic_prefixes):
+            return True
+
+        if normalized.startswith("sobre "):
+            return True
+
+        if "del catálogo" in normalized or "del catalogo" in normalized:
+            return True
+
+        if "más recientes" in normalized or "mas recientes" in normalized:
+            return True
+
+        return False
+
     quoted_patterns = [
-        r"del libro ['\"]([^'\"]+)['\"]",
-        r"de ['\"]([^'\"]+)['\"]",
-        r"libro ['\"]([^'\"]+)['\"]",
-        r"resume ['\"]([^'\"]+)['\"]",
-        r"resumen ['\"]([^'\"]+)['\"]",
-        r"['\"]([^'\"]+)['\"]\\s*$",  # Title at end in quotes
+        r"['\"]([^'\"]+)['\"]",
     ]
     
     for pattern in quoted_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            candidate = match.group(1).strip()
+            if not _is_generic_candidate(candidate):
+                return candidate
     
-    # Then try patterns without quotes (less specific)
-    # Match capitalized words after key phrases
-    unquoted_patterns = [
-        r"del libro\\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\\s]+?)(?:\\s+(?:es|son|trata|habla|presenta)|[.,?!]|$)",
-        r"resume(?:\\s+el\\s+libro)?\\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\\s]+?)(?:\\s+(?:es|son|trata)|[.,?!]|$)",
-        r"(?:ideas|puntos)\\s+(?:centrales|principales)\\s+de\\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\\s]+?)(?:\\s+(?:es|son)|[.,?!]|$)",
-        r"libro\\s+([A-ZÁÉÍÓÚÑ][a-záéíóúñA-ZÁÉÍÓÚÑ\\s]+?)(?:\\s+(?:es|son|trata)|[.,?!]|$)",
-    ]
-    
-    for pattern in unquoted_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            title = match.group(1).strip()
-            # Filter out common false positives
-            if title.lower() not in ['el', 'la', 'los', 'las', 'un', 'una', 'del', 'de']:
-                return title
+    de_matches = re.findall(r"\bde\s+([^,.;!?]+)", text, re.IGNORECASE)
+    if de_matches:
+        title = de_matches[-1].strip(" .,!?:;")
+        title = re.sub(r"^(?:lectura|analisis|análisis|informe)\s+de\s+", "", title, flags=re.IGNORECASE)
+        if title and len(title) > 2 and not _is_generic_candidate(title):
+            return title
+
+    # Handles: "Resume en diez puntos Libres"
+    resume_match = re.search(
+        r"\b(?:resume|resumen(?:\s+de)?|resumir)\b(?:\s+en\s+\w+\s+\w+)?\s+(.+)$",
+        text,
+        re.IGNORECASE,
+    )
+    if resume_match:
+        title = resume_match.group(1).strip(" .,!?:;")
+        title = re.sub(r"^(?:el|la|los|las|libro)\s+", "", title, flags=re.IGNORECASE)
+        if title and len(title) > 2 and not _is_generic_candidate(title):
+            return title
     
     return None
 
@@ -87,30 +115,23 @@ def _select_tool_and_input(text: str) -> tuple:
     """
     lower = text.lower()
 
-    # Check for book summary requests (high priority)
-    summary_keywords = [
-        "ideas centrales",
-        "ideas principales",
-        "resume",
-        "resumen",
-        "resumir",
-        "sintetiza",
-        "síntesis",
-        "puntos clave",
-        "puntos principales",
-        "tres ideas",
-        "3 ideas",
-        "principales temas",
-        "mensaje principal",
+    deep_insight_keywords = [
+        "informe de lectura",
+        "análisis profundo",
+        "analisis profundo",
+        "análisis detallado",
+        "analisis detallado",
+        "lectura profunda",
     ]
+    if any(keyword in lower for keyword in deep_insight_keywords):
+        book_title = _extract_book_title(text)
+        return (deep_insights_book_tool, {"book_title": book_title or "", "question": text})
+
+    summary_keywords = ["ideas centrales", "resume", "resumen de"]
     
     if any(keyword in lower for keyword in summary_keywords):
-        # Try to extract book title
         book_title = _extract_book_title(text)
-        if book_title:
-            return (summarize_book, book_title)
-        # If no title found, let search_books handle it
-        return (search_books, text)
+        return (summarize_book_tool, {"book_title": book_title or "", "question": text})
 
     # Contratos / derechos
     if any(word in lower for word in ["contrato", "contratos", "derechos", "licencia", "licencias"]):
